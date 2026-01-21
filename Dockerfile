@@ -36,5 +36,5 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app
 
-# Command to run the MCP server
-CMD ["uv", "run", "server.py"]
+# Command to run the MCP server (streamable HTTP)
+CMD ["uv", "run", "http_server.py"]
