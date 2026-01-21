@@ -85,6 +85,20 @@ With this MCP server, you can use Claude to:
   - pydantic
   - and other packages for data processing
 
+## Rate Limiting & Caching (to reduce Yahoo throttling)
+
+This server includes built-in throttling protection to avoid Yahoo Finance rate limits.
+You can tune the behavior with environment variables:
+
+| Variable | Default | Description |
+|---|---:|---|
+| `YFINANCE_RATE_WINDOW_SECONDS` | `60` | Global rate limit window (seconds) |
+| `YFINANCE_MAX_REQUESTS_PER_WINDOW` | `30` | Max requests per window |
+| `YFINANCE_MIN_TICKER_INTERVAL_SECONDS` | `2` | Minimum seconds between requests for the same ticker |
+| `YFINANCE_CACHE_TTL_SECONDS` | `60` | Response cache TTL (seconds) |
+| `YFINANCE_MAX_RETRIES` | `2` | Retry attempts on rate-limit errors |
+| `YFINANCE_BACKOFF_BASE_SECONDS` | `1.5` | Base backoff delay (seconds) |
+
 ## Setup
 
 1. Clone this repository:

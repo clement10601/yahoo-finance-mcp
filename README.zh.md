@@ -83,6 +83,20 @@
   - pydantic
   - 以及其他数据处理包
 
+## 限速与缓存（减少 Yahoo 限流）
+
+服务器内置限速与缓存，以降低 Yahoo Finance 的限流风险。
+可通过环境变量进行调整：
+
+| 变量 | 默认值 | 说明 |
+|---|---:|---|
+| `YFINANCE_RATE_WINDOW_SECONDS` | `60` | 全局限速时间窗口（秒） |
+| `YFINANCE_MAX_REQUESTS_PER_WINDOW` | `30` | 每个窗口最大请求数 |
+| `YFINANCE_MIN_TICKER_INTERVAL_SECONDS` | `2` | 同一股票最小请求间隔（秒） |
+| `YFINANCE_CACHE_TTL_SECONDS` | `60` | 响应缓存 TTL（秒） |
+| `YFINANCE_MAX_RETRIES` | `2` | 触发限速时的重试次数 |
+| `YFINANCE_BACKOFF_BASE_SECONDS` | `1.5` | 基础退避时间（秒） |
+
 ## 安装
 
 1. 克隆此仓库：
