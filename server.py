@@ -1,9 +1,93 @@
+import asyncio
 import json
+import os
+import random
+import time
 from enum import Enum
 
 import pandas as pd
 import yfinance as yf
 from mcp.server.fastmcp import FastMCP
+
+
+# --- Basic rate limiting & caching to reduce Yahoo throttling ---
+_GLOBAL_WINDOW_SECONDS = float(os.getenv("YFINANCE_RATE_WINDOW_SECONDS", "60"))
+_GLOBAL_MAX_REQUESTS = int(os.getenv("YFINANCE_MAX_REQUESTS_PER_WINDOW", "30"))
+_PER_TICKER_MIN_INTERVAL_SECONDS = float(
+    os.getenv("YFINANCE_MIN_TICKER_INTERVAL_SECONDS", "2")
+)
+_CACHE_TTL_SECONDS = float(os.getenv("YFINANCE_CACHE_TTL_SECONDS", "60"))
+_MAX_RETRIES = int(os.getenv("YFINANCE_MAX_RETRIES", "2"))
+_BACKOFF_BASE_SECONDS = float(os.getenv("YFINANCE_BACKOFF_BASE_SECONDS", "1.5"))
+
+_global_request_timestamps: list[float] = []
+_last_ticker_request: dict[str, float] = {}
+_cache: dict[tuple, tuple[float, str]] = {}
+
+
+def _prune_global_timestamps(now: float) -> None:
+    cutoff = now - _GLOBAL_WINDOW_SECONDS
+    while _global_request_timestamps and _global_request_timestamps[0] < cutoff:
+        _global_request_timestamps.pop(0)
+
+
+def _rate_limit_check(ticker: str) -> tuple[bool, str | None]:
+    now = time.monotonic()
+
+    # Global window limit
+    _prune_global_timestamps(now)
+    if len(_global_request_timestamps) >= _GLOBAL_MAX_REQUESTS:
+        retry_after = _GLOBAL_WINDOW_SECONDS - (now - _global_request_timestamps[0])
+        return True, f"Rate limited. Try after {retry_after:.1f}s."
+
+    # Per-ticker minimum interval
+    last = _last_ticker_request.get(ticker)
+    if last is not None:
+        elapsed = now - last
+        if elapsed < _PER_TICKER_MIN_INTERVAL_SECONDS:
+            retry_after = _PER_TICKER_MIN_INTERVAL_SECONDS - elapsed
+            return True, f"Rate limited. Try after {retry_after:.1f}s."
+
+    _global_request_timestamps.append(now)
+    _last_ticker_request[ticker] = now
+    return False, None
+
+
+def _cache_get(cache_key: tuple) -> str | None:
+    now = time.monotonic()
+    cached = _cache.get(cache_key)
+    if not cached:
+        return None
+    expires_at, value = cached
+    if now >= expires_at:
+        _cache.pop(cache_key, None)
+        return None
+    return value
+
+
+def _cache_set(cache_key: tuple, value: str) -> None:
+    expires_at = time.monotonic() + _CACHE_TTL_SECONDS
+    _cache[cache_key] = (expires_at, value)
+
+
+def _is_rate_limited_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "too many requests" in message or "rate limited" in message
+
+
+async def _execute_with_retry(fetcher, *args, **kwargs):
+    last_error = None
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            return fetcher(*args, **kwargs)
+        except Exception as exc:
+            last_error = exc
+            if not _is_rate_limited_error(exc) or attempt >= _MAX_RETRIES:
+                raise
+            backoff = _BACKOFF_BASE_SECONDS * (2**attempt)
+            backoff += random.uniform(0, 0.3 * backoff)
+            await asyncio.sleep(backoff)
+    raise last_error
 
 
 # Define an enum for the type of financial statement
@@ -85,9 +169,19 @@ async def get_historical_stock_prices(
             Intraday data cannot extend last 60 days
             Default is "1d"
     """
+    cache_key = ("get_historical_stock_prices", ticker, period, interval)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    rate_limited, message = _rate_limit_check(ticker)
+    if rate_limited:
+        return message or "Rate limited. Try after a while."
+
     company = yf.Ticker(ticker)
     try:
-        if company.isin is None:
+        isin = await _execute_with_retry(lambda: company.isin)
+        if isin is None:
             print(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
@@ -95,9 +189,16 @@ async def get_historical_stock_prices(
         return f"Error: getting historical stock prices for {ticker}: {e}"
 
     # If the company is found, get the historical data
-    hist_data = company.history(period=period, interval=interval)
+    try:
+        hist_data = await _execute_with_retry(
+            lambda: company.history(period=period, interval=interval)
+        )
+    except Exception as e:
+        print(f"Error: getting historical stock prices for {ticker}: {e}")
+        return f"Error: getting historical stock prices for {ticker}: {e}"
     hist_data = hist_data.reset_index(names="Date")
     hist_data = hist_data.to_json(orient="records", date_format="iso")
+    _cache_set(cache_key, hist_data)
     return hist_data
 
 
@@ -113,16 +214,32 @@ Args:
 )
 async def get_stock_info(ticker: str) -> str:
     """Get stock information for a given ticker symbol"""
+    cache_key = ("get_stock_info", ticker)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    rate_limited, message = _rate_limit_check(ticker)
+    if rate_limited:
+        return message or "Rate limited. Try after a while."
+
     company = yf.Ticker(ticker)
     try:
-        if company.isin is None:
+        isin = await _execute_with_retry(lambda: company.isin)
+        if isin is None:
             print(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
         print(f"Error: getting stock information for {ticker}: {e}")
         return f"Error: getting stock information for {ticker}: {e}"
-    info = company.info
-    return json.dumps(info)
+    try:
+        info = await _execute_with_retry(lambda: company.info)
+    except Exception as e:
+        print(f"Error: getting stock information for {ticker}: {e}")
+        return f"Error: getting stock information for {ticker}: {e}"
+    result = json.dumps(info)
+    _cache_set(cache_key, result)
+    return result
 
 
 @yfinance_server.tool(
@@ -141,9 +258,19 @@ async def get_yahoo_finance_news(ticker: str) -> str:
         ticker: str
             The ticker symbol of the stock to get news for, e.g. "AAPL"
     """
+    cache_key = ("get_yahoo_finance_news", ticker)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    rate_limited, message = _rate_limit_check(ticker)
+    if rate_limited:
+        return message or "Rate limited. Try after a while."
+
     company = yf.Ticker(ticker)
     try:
-        if company.isin is None:
+        isin = await _execute_with_retry(lambda: company.isin)
+        if isin is None:
             print(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
@@ -152,13 +279,13 @@ async def get_yahoo_finance_news(ticker: str) -> str:
 
     # If the company is found, get the news
     try:
-        news = company.news
+        news = await _execute_with_retry(lambda: company.news)
     except Exception as e:
         print(f"Error: getting news for {ticker}: {e}")
         return f"Error: getting news for {ticker}: {e}"
 
     news_list = []
-    for news in company.news:
+    for news in news:
         if news.get("content", {}).get("contentType", "") == "STORY":
             title = news.get("content", {}).get("title", "")
             summary = news.get("content", {}).get("summary", "")
@@ -170,7 +297,9 @@ async def get_yahoo_finance_news(ticker: str) -> str:
     if not news_list:
         print(f"No news found for company that searched with {ticker} ticker.")
         return f"No news found for company that searched with {ticker} ticker."
-    return "\n\n".join(news_list)
+    result = "\n\n".join(news_list)
+    _cache_set(cache_key, result)
+    return result
 
 
 @yfinance_server.tool(
@@ -184,14 +313,29 @@ Args:
 )
 async def get_stock_actions(ticker: str) -> str:
     """Get stock dividends and stock splits for a given ticker symbol"""
+    cache_key = ("get_stock_actions", ticker)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    rate_limited, message = _rate_limit_check(ticker)
+    if rate_limited:
+        return message or "Rate limited. Try after a while."
+
     try:
         company = yf.Ticker(ticker)
     except Exception as e:
         print(f"Error: getting stock actions for {ticker}: {e}")
         return f"Error: getting stock actions for {ticker}: {e}"
-    actions_df = company.actions
+    try:
+        actions_df = await _execute_with_retry(lambda: company.actions)
+    except Exception as e:
+        print(f"Error: getting stock actions for {ticker}: {e}")
+        return f"Error: getting stock actions for {ticker}: {e}"
     actions_df = actions_df.reset_index(names="Date")
-    return actions_df.to_json(orient="records", date_format="iso")
+    result = actions_df.to_json(orient="records", date_format="iso")
+    _cache_set(cache_key, result)
+    return result
 
 
 @yfinance_server.tool(
@@ -207,10 +351,19 @@ Args:
 )
 async def get_financial_statement(ticker: str, financial_type: str) -> str:
     """Get financial statement for a given ticker symbol"""
+    cache_key = ("get_financial_statement", ticker, financial_type)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    rate_limited, message = _rate_limit_check(ticker)
+    if rate_limited:
+        return message or "Rate limited. Try after a while."
 
     company = yf.Ticker(ticker)
     try:
-        if company.isin is None:
+        isin = await _execute_with_retry(lambda: company.isin)
+        if isin is None:
             print(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
@@ -218,19 +371,25 @@ async def get_financial_statement(ticker: str, financial_type: str) -> str:
         return f"Error: getting financial statement for {ticker}: {e}"
 
     if financial_type == FinancialType.income_stmt:
-        financial_statement = company.income_stmt
+        fetcher = lambda: company.income_stmt
     elif financial_type == FinancialType.quarterly_income_stmt:
-        financial_statement = company.quarterly_income_stmt
+        fetcher = lambda: company.quarterly_income_stmt
     elif financial_type == FinancialType.balance_sheet:
-        financial_statement = company.balance_sheet
+        fetcher = lambda: company.balance_sheet
     elif financial_type == FinancialType.quarterly_balance_sheet:
-        financial_statement = company.quarterly_balance_sheet
+        fetcher = lambda: company.quarterly_balance_sheet
     elif financial_type == FinancialType.cashflow:
-        financial_statement = company.cashflow
+        fetcher = lambda: company.cashflow
     elif financial_type == FinancialType.quarterly_cashflow:
-        financial_statement = company.quarterly_cashflow
+        fetcher = lambda: company.quarterly_cashflow
     else:
         return f"Error: invalid financial type {financial_type}. Please use one of the following: {FinancialType.income_stmt}, {FinancialType.quarterly_income_stmt}, {FinancialType.balance_sheet}, {FinancialType.quarterly_balance_sheet}, {FinancialType.cashflow}, {FinancialType.quarterly_cashflow}."
+
+    try:
+        financial_statement = await _execute_with_retry(fetcher)
+    except Exception as e:
+        print(f"Error: getting financial statement for {ticker}: {e}")
+        return f"Error: getting financial statement for {ticker}: {e}"
 
     # Create a list to store all the json objects
     result = []
@@ -252,7 +411,9 @@ async def get_financial_statement(ticker: str, financial_type: str) -> str:
 
         result.append(date_obj)
 
-    return json.dumps(result)
+    result_json = json.dumps(result)
+    _cache_set(cache_key, result_json)
+    return result_json
 
 
 @yfinance_server.tool(
@@ -268,10 +429,19 @@ Args:
 )
 async def get_holder_info(ticker: str, holder_type: str) -> str:
     """Get holder information for a given ticker symbol"""
+    cache_key = ("get_holder_info", ticker, holder_type)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    rate_limited, message = _rate_limit_check(ticker)
+    if rate_limited:
+        return message or "Rate limited. Try after a while."
 
     company = yf.Ticker(ticker)
     try:
-        if company.isin is None:
+        isin = await _execute_with_retry(lambda: company.isin)
+        if isin is None:
             print(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
@@ -279,19 +449,68 @@ async def get_holder_info(ticker: str, holder_type: str) -> str:
         return f"Error: getting holder info for {ticker}: {e}"
 
     if holder_type == HolderType.major_holders:
-        return company.major_holders.reset_index(names="metric").to_json(orient="records")
+        try:
+            result = await _execute_with_retry(
+                lambda: company.major_holders.reset_index(names="metric").to_json(
+                    orient="records"
+                )
+            )
+        except Exception as e:
+            print(f"Error: getting holder info for {ticker}: {e}")
+            return f"Error: getting holder info for {ticker}: {e}"
     elif holder_type == HolderType.institutional_holders:
-        return company.institutional_holders.to_json(orient="records")
+        try:
+            result = await _execute_with_retry(
+                lambda: company.institutional_holders.to_json(orient="records")
+            )
+        except Exception as e:
+            print(f"Error: getting holder info for {ticker}: {e}")
+            return f"Error: getting holder info for {ticker}: {e}"
     elif holder_type == HolderType.mutualfund_holders:
-        return company.mutualfund_holders.to_json(orient="records", date_format="iso")
+        try:
+            result = await _execute_with_retry(
+                lambda: company.mutualfund_holders.to_json(
+                    orient="records", date_format="iso"
+                )
+            )
+        except Exception as e:
+            print(f"Error: getting holder info for {ticker}: {e}")
+            return f"Error: getting holder info for {ticker}: {e}"
     elif holder_type == HolderType.insider_transactions:
-        return company.insider_transactions.to_json(orient="records", date_format="iso")
+        try:
+            result = await _execute_with_retry(
+                lambda: company.insider_transactions.to_json(
+                    orient="records", date_format="iso"
+                )
+            )
+        except Exception as e:
+            print(f"Error: getting holder info for {ticker}: {e}")
+            return f"Error: getting holder info for {ticker}: {e}"
     elif holder_type == HolderType.insider_purchases:
-        return company.insider_purchases.to_json(orient="records", date_format="iso")
+        try:
+            result = await _execute_with_retry(
+                lambda: company.insider_purchases.to_json(
+                    orient="records", date_format="iso"
+                )
+            )
+        except Exception as e:
+            print(f"Error: getting holder info for {ticker}: {e}")
+            return f"Error: getting holder info for {ticker}: {e}"
     elif holder_type == HolderType.insider_roster_holders:
-        return company.insider_roster_holders.to_json(orient="records", date_format="iso")
+        try:
+            result = await _execute_with_retry(
+                lambda: company.insider_roster_holders.to_json(
+                    orient="records", date_format="iso"
+                )
+            )
+        except Exception as e:
+            print(f"Error: getting holder info for {ticker}: {e}")
+            return f"Error: getting holder info for {ticker}: {e}"
     else:
         return f"Error: invalid holder type {holder_type}. Please use one of the following: {HolderType.major_holders}, {HolderType.institutional_holders}, {HolderType.mutualfund_holders}, {HolderType.insider_transactions}, {HolderType.insider_purchases}, {HolderType.insider_roster_holders}."
+
+    _cache_set(cache_key, result)
+    return result
 
 
 @yfinance_server.tool(
@@ -305,16 +524,32 @@ Args:
 )
 async def get_option_expiration_dates(ticker: str) -> str:
     """Fetch the available options expiration dates for a given ticker symbol."""
+    cache_key = ("get_option_expiration_dates", ticker)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    rate_limited, message = _rate_limit_check(ticker)
+    if rate_limited:
+        return message or "Rate limited. Try after a while."
 
     company = yf.Ticker(ticker)
     try:
-        if company.isin is None:
+        isin = await _execute_with_retry(lambda: company.isin)
+        if isin is None:
             print(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
         print(f"Error: getting option expiration dates for {ticker}: {e}")
         return f"Error: getting option expiration dates for {ticker}: {e}"
-    return json.dumps(company.options)
+    try:
+        options = await _execute_with_retry(lambda: company.options)
+    except Exception as e:
+        print(f"Error: getting option expiration dates for {ticker}: {e}")
+        return f"Error: getting option expiration dates for {ticker}: {e}"
+    result = json.dumps(options)
+    _cache_set(cache_key, result)
+    return result
 
 
 @yfinance_server.tool(
@@ -342,9 +577,19 @@ async def get_option_chain(ticker: str, expiration_date: str, option_type: str) 
         str: JSON string containing the option chain data
     """
 
+    cache_key = ("get_option_chain", ticker, expiration_date, option_type)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    rate_limited, message = _rate_limit_check(ticker)
+    if rate_limited:
+        return message or "Rate limited. Try after a while."
+
     company = yf.Ticker(ticker)
     try:
-        if company.isin is None:
+        isin = await _execute_with_retry(lambda: company.isin)
+        if isin is None:
             print(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
@@ -352,7 +597,13 @@ async def get_option_chain(ticker: str, expiration_date: str, option_type: str) 
         return f"Error: getting option chain for {ticker}: {e}"
 
     # Check if the expiration date is valid
-    if expiration_date not in company.options:
+    try:
+        options = await _execute_with_retry(lambda: company.options)
+    except Exception as e:
+        print(f"Error: getting option chain for {ticker}: {e}")
+        return f"Error: getting option chain for {ticker}: {e}"
+
+    if expiration_date not in options:
         return f"Error: No options available for the date {expiration_date}. You can use `get_option_expiration_dates` to get the available expiration dates."
 
     # Check if the option type is valid
@@ -360,13 +611,20 @@ async def get_option_chain(ticker: str, expiration_date: str, option_type: str) 
         return "Error: Invalid option type. Please use 'calls' or 'puts'."
 
     # Get the option chain
-    option_chain = company.option_chain(expiration_date)
+    try:
+        option_chain = await _execute_with_retry(lambda: company.option_chain(expiration_date))
+    except Exception as e:
+        print(f"Error: getting option chain for {ticker}: {e}")
+        return f"Error: getting option chain for {ticker}: {e}"
     if option_type == "calls":
-        return option_chain.calls.to_json(orient="records", date_format="iso")
+        result = option_chain.calls.to_json(orient="records", date_format="iso")
     elif option_type == "puts":
-        return option_chain.puts.to_json(orient="records", date_format="iso")
+        result = option_chain.puts.to_json(orient="records", date_format="iso")
     else:
         return f"Error: invalid option type {option_type}. Please use one of the following: calls, puts."
+
+    _cache_set(cache_key, result)
+    return result
 
 
 @yfinance_server.tool(
@@ -384,9 +642,19 @@ Args:
 )
 async def get_recommendations(ticker: str, recommendation_type: str, months_back: int = 12) -> str:
     """Get recommendations or upgrades/downgrades for a given ticker symbol"""
+    cache_key = ("get_recommendations", ticker, recommendation_type, months_back)
+    cached = _cache_get(cache_key)
+    if cached is not None:
+        return cached
+
+    rate_limited, message = _rate_limit_check(ticker)
+    if rate_limited:
+        return message or "Rate limited. Try after a while."
+
     company = yf.Ticker(ticker)
     try:
-        if company.isin is None:
+        isin = await _execute_with_retry(lambda: company.isin)
+        if isin is None:
             print(f"Company ticker {ticker} not found.")
             return f"Company ticker {ticker} not found."
     except Exception as e:
@@ -394,10 +662,16 @@ async def get_recommendations(ticker: str, recommendation_type: str, months_back
         return f"Error: getting recommendations for {ticker}: {e}"
     try:
         if recommendation_type == RecommendationType.recommendations:
-            return company.recommendations.to_json(orient="records")
+            result = await _execute_with_retry(
+                lambda: company.recommendations.to_json(orient="records")
+            )
+            _cache_set(cache_key, result)
+            return result
         elif recommendation_type == RecommendationType.upgrades_downgrades:
             # Get the upgrades/downgrades based on the cutoff date
-            upgrades_downgrades = company.upgrades_downgrades.reset_index()
+            upgrades_downgrades = await _execute_with_retry(
+                lambda: company.upgrades_downgrades.reset_index()
+            )
             cutoff_date = pd.Timestamp.now() - pd.DateOffset(months=months_back)
             upgrades_downgrades = upgrades_downgrades[
                 upgrades_downgrades["GradeDate"] >= cutoff_date
@@ -405,7 +679,9 @@ async def get_recommendations(ticker: str, recommendation_type: str, months_back
             upgrades_downgrades = upgrades_downgrades.sort_values("GradeDate", ascending=False)
             # Get the first occurrence (most recent) for each firm
             latest_by_firm = upgrades_downgrades.drop_duplicates(subset=["Firm"])
-            return latest_by_firm.to_json(orient="records", date_format="iso")
+            result = latest_by_firm.to_json(orient="records", date_format="iso")
+            _cache_set(cache_key, result)
+            return result
     except Exception as e:
         print(f"Error: getting recommendations for {ticker}: {e}")
         return f"Error: getting recommendations for {ticker}: {e}"
