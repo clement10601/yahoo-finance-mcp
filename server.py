@@ -7,7 +7,7 @@ from enum import Enum
 
 import pandas as pd
 import yfinance as yf
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 
 # --- Basic rate limiting & caching to reduce Yahoo throttling ---
