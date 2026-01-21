@@ -124,6 +124,18 @@ uv run server.py
 
 这将启动服务器并允许您测试可用工具。
 
+### Streamable HTTP 模式
+
+使用 Streamable HTTP 传输启动服务器：
+
+```bash
+uv run http_server.py
+```
+
+MCP 端点：
+
+- **Streamable HTTP**：`http://localhost:8000/mcp`
+
 ### 与 Claude Desktop 集成
 
 要将此服务器与 Claude Desktop 集成：

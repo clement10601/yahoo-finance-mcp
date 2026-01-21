@@ -126,6 +126,18 @@ uv run server.py
 
 This will start the server and allow you to test the available tools.
 
+### Streamable HTTP Mode
+
+Run the server with streamable HTTP transport:
+
+```bash
+uv run http_server.py
+```
+
+The MCP endpoint will be available at:
+
+- **Streamable HTTP**: `http://localhost:8000/mcp`
+
 ### Integration with Claude for Desktop
 
 To integrate this server with Claude for Desktop:
