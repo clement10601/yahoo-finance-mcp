@@ -13,9 +13,8 @@ ENV UV_LINK_MODE=copy
 # Copy project files
 COPY pyproject.toml .
 
-# Install the project's dependencies using uv
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system -e .
+# Install the project's dependencies using uv (no BuildKit cache mount)
+RUN uv pip install --system -e .
 
 # Copy the rest of the application code
 COPY . .
